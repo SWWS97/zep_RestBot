@@ -1,0 +1,13 @@
+[project]
+name = "zep-webhook"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.117.1",
+    "httpx>=0.28.1",
+    "playwright>=1.55.0",
+    "python-dotenv>=1.1.1",
+    "uvicorn>=0.36.0",
+]
