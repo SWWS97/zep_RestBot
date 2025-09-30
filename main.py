@@ -186,6 +186,9 @@ class BreakBot:
 
         self.running_timers: set[asyncio.Task] = set()
 
+        # 사용자별 진행 중인 휴식 상태 {who: {"task": asyncio.Task, "until": float, "minutes": int}}
+        self.active_breaks: dict[str, dict] = {}
+
     # ── 안전 전송(레이트리밋 백오프 + 직렬화 + 최소 간격) ──
     async def type_and_send(self, text: str):
         async with self._send_lock:
@@ -247,12 +250,24 @@ class BreakBot:
         if DEBUG: print("[BOT SEND]", text)
         await self.type_and_send(text)
 
+    def _fmt_remaining(self, until_ts: float) -> str:
+        left = max(0, int(until_ts - time.time()))
+        m, s = divmod(left, 60)
+        return f"{m}분 {s}초" if m else f"{s}초"
+
     # ── 공용: 휴식 시작 ──
     async def start_break(self, minutes: int, who: str = "누군가"):
         minutes = max(1, min(minutes, 180))
 
-        # 전역 '분' 가드: 최근 GLOBAL_MINUTE_GUARD초 내 동일 분이면 무시
+        # 동일 사용자가 이미 휴식 중이면 새로 시작하지 않음
         now = time.time()
+        if who in self.active_breaks:
+            until = self.active_breaks[who]["until"]
+            if now < until:
+                await self.say(f"{who}님은 현재 휴식 중입니다. (남은 시간: {self._fmt_remaining(until)})")
+                return {"ok": False, "reason": "already-on-break"}
+
+        # 전역 '분' 가드: 최근 GLOBAL_MINUTE_GUARD초 내 동일 분이면 무시
         if now - self.minute_global_guard.get(minutes, 0.0) < GLOBAL_MINUTE_GUARD:
             if DEBUG: print("[GLOBAL minute guard hit]", minutes)
             return {"ok": False, "reason": "minute-guard"}
@@ -270,14 +285,26 @@ class BreakBot:
 
         await self.say(start_text)
 
+        # 종료 시각을 기록하고 사용자별 활성 휴식에 등록
+        until_ts = time.time() + (minutes * 60)
+        def _drop():
+            self.active_breaks.pop(who, None)
+
         async def timer():
             try:
                 await asyncio.sleep(minutes * 60)
                 await asyncio.sleep(random.uniform(0, 0.7))  # 자연스러운 딜레이
                 await self.say(end_text)
+            except asyncio.CancelledError:
+                # 복귀로 인한 취소: 일반 종료 멘트는 내지 않음
+                pass
             finally:
+                _drop()
                 self.running_timers.discard(asyncio.current_task())
-        self.running_timers.add(asyncio.create_task(timer()))
+
+        t = asyncio.create_task(timer())
+        self.running_timers.add(t)
+        self.active_breaks[who] = {"task": t, "until": until_ts, "minutes": minutes}
 
         return {"ok": True}
 
@@ -291,9 +318,26 @@ class BreakBot:
         if START_NOISE_RE.search(t): return
         if t.isdigit(): return
 
-        # 복귀 멘트(짧은 응답, 2초 쿨다운)
+        # 복귀 멘트(짧은 응답, 2초 쿨다운 또는 조기 종료)
         if BACK_RE.search(t):
             now = time.time()
+            who_back = sender or (self._recent_sender[0] if (self._recent_sender and now - self._recent_sender[1] <= RECENT_NAME_SEC) else None)
+
+            # 같은 사람이 복귀하면 진행 중인 자신의 휴식을 취소(조기 종료)
+            if who_back and who_back in self.active_breaks and now < self.active_breaks[who_back]["until"]:
+                task = self.active_breaks[who_back]["task"]
+                try:
+                    task.cancel()  # 타이머 즉시 취소
+                except:
+                    pass
+                # 상태 제거
+                self.active_breaks.pop(who_back, None)
+                # 복귀 확인과 즉시 종료 멘트를 연달아 전송
+                await self.say(random.choice(BACK_TPL))
+                await self.say(f"⏰휴식 종료 - {who_back}")
+                return
+
+            # 진행 중 휴식이 없으면 일반 복귀 멘트(스팸 방지 2초 쿨다운)
             if now >= self._back_cooldown:
                 self._back_cooldown = now + 2
                 await self.say(random.choice(BACK_TPL))
@@ -326,6 +370,12 @@ class BreakBot:
         while True:
             try:
                 bubbles = await self.page.query_selector_all(BUBBLE_SEL)
+
+                # 정리: 종료된 타이머의 active_breaks 항목 제거
+                for name, meta in list(self.active_breaks.items()):
+                    t = meta.get("task")
+                    if t and t.done():
+                        self.active_breaks.pop(name, None)
 
                 for b in bubbles:
                     try:
